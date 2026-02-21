@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { buildTeamAggregates } from "@/lib/teams/grouping";
 import { runWithConcurrency } from "@/lib/utils/async";
@@ -186,6 +186,112 @@ function matchesRegistrationFilter(
   return !isSolo(record);
 }
 
+const PANEL_WIDTH_KEY = "luma-review:panel-width";
+const DEFAULT_PANEL_WIDTH = 580;
+const MIN_PANEL_WIDTH = 320;
+const MAX_PANEL_RATIO = 0.6;
+
+const SPOTS_KEY = "luma-review:spots-remaining";
+const COLUMNS_KEY = "luma-review:visible-columns";
+
+type PeopleColumn = "team" | "status" | "buildIdea";
+const ALL_PEOPLE_COLUMNS: { key: PeopleColumn; label: string }[] = [
+  { key: "team", label: "Team" },
+  { key: "status", label: "Status" },
+  { key: "buildIdea", label: "Build Idea" },
+];
+const DEFAULT_VISIBLE: PeopleColumn[] = ["team", "status", "buildIdea"];
+
+function readVisibleColumns(): PeopleColumn[] {
+  if (typeof window === "undefined") return DEFAULT_VISIBLE;
+  const stored = localStorage.getItem(COLUMNS_KEY);
+  if (!stored) return DEFAULT_VISIBLE;
+  try {
+    const parsed = JSON.parse(stored);
+    if (Array.isArray(parsed)) return parsed;
+  } catch { /* ignore */ }
+  return DEFAULT_VISIBLE;
+}
+
+function writeVisibleColumns(cols: PeopleColumn[]): void {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(COLUMNS_KEY, JSON.stringify(cols));
+}
+
+const DRAFT_STATUS_KEY = "luma-review:draft-status";
+type DraftStatus = "accepted" | "rejected";
+type DraftStatusMap = Map<string, DraftStatus>;
+type DraftFilter = "all" | "accepted" | "rejected" | "undecided";
+
+function readDraftStatus(): DraftStatusMap {
+  if (typeof window === "undefined") return new Map();
+  const stored = localStorage.getItem(DRAFT_STATUS_KEY);
+  if (!stored) return new Map();
+  try {
+    const parsed = JSON.parse(stored);
+    if (Array.isArray(parsed)) {
+      // Migrate from old draft-rejections format (array of IDs)
+      return new Map(parsed.map((id: string) => [id, "rejected" as DraftStatus]));
+    }
+    if (parsed && typeof parsed === "object") {
+      return new Map(Object.entries(parsed) as Array<[string, DraftStatus]>);
+    }
+  } catch { /* ignore */ }
+  return new Map();
+}
+
+function writeDraftStatus(map: DraftStatusMap): void {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(DRAFT_STATUS_KEY, JSON.stringify(Object.fromEntries(map)));
+}
+
+const FILTERS_KEY = "luma-review:filters";
+
+type PersistedFilters = {
+  activeTab?: Tab;
+  approvalFilter?: GuestStatus | "all";
+  registrationFilter?: RegistrationFilter;
+  searchTerm?: string;
+  buildIdeaFilter?: string;
+  buildIdeaPresence?: "all" | "filled" | "empty";
+  draftFilter?: DraftFilter;
+  includeSoloTeams?: boolean;
+  selectedEventApiId?: string | null;
+  showAllEvents?: boolean;
+};
+
+function readFilters(): PersistedFilters {
+  if (typeof window === "undefined") return {};
+  const stored = localStorage.getItem(FILTERS_KEY);
+  if (!stored) return {};
+  try {
+    return JSON.parse(stored);
+  } catch { /* ignore */ }
+  return {};
+}
+
+function writeFilters(filters: PersistedFilters): void {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(FILTERS_KEY, JSON.stringify(filters));
+}
+
+function readSpots(): number | null {
+  if (typeof window === "undefined") return null;
+  const stored = localStorage.getItem(SPOTS_KEY);
+  if (stored === null) return null;
+  const num = Number(stored);
+  return Number.isFinite(num) ? num : null;
+}
+
+function writeSpots(value: number | null): void {
+  if (typeof window === "undefined") return;
+  if (value === null) {
+    localStorage.removeItem(SPOTS_KEY);
+  } else {
+    localStorage.setItem(SPOTS_KEY, String(value));
+  }
+}
+
 function buildGuestStatusPayload(
   status: TargetStatus,
   shouldRefund: boolean,
@@ -198,6 +304,26 @@ function buildGuestStatusPayload(
   }
 
   return { status };
+}
+
+function escapeCsvField(value: string): string {
+  if (value.includes(",") || value.includes('"') || value.includes("\n")) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
+}
+
+function downloadCsv(filename: string, headers: string[], rows: string[][]): void {
+  const headerLine = headers.map(escapeCsvField).join(",");
+  const bodyLines = rows.map((row) => row.map(escapeCsvField).join(","));
+  const csv = [headerLine, ...bodyLines].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 /* ─── Sub-components ─── */
@@ -243,14 +369,26 @@ function BannerNotice({ banner }: { banner: Banner }) {
 }
 
 function DetailItem({ label, value }: { label: string; value: string | null | undefined }) {
+  const isUrl = value && /^https?:\/\//i.test(value);
   return (
     <div>
       <p className="text-[11px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
         {label}
       </p>
-      <p className="mt-0.5 break-words text-sm text-[var(--text-secondary)]">
-        {value || "\u2014"}
-      </p>
+      {isUrl ? (
+        <a
+          href={value}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mt-0.5 block break-words text-sm text-[var(--accent-light)] underline decoration-[var(--accent-light)]/30 underline-offset-2 transition-colors hover:text-[var(--accent)] hover:decoration-[var(--accent)]/60"
+        >
+          {value.replace(/^https?:\/\/(www\.)?/i, "")}
+        </a>
+      ) : (
+        <p className="mt-0.5 break-words text-sm text-[var(--text-secondary)]">
+          {value || "\u2014"}
+        </p>
+      )}
     </div>
   );
 }
@@ -266,6 +404,8 @@ const inputClass =
 /* ─── Main component ─── */
 
 export default function LumaDashboard() {
+  const [filtersHydrated, setFiltersHydrated] = useState(false);
+
   const [events, setEvents] = useState<LumaEventSummary[]>([]);
   const [eventsLoading, setEventsLoading] = useState(true);
   const [eventsError, setEventsError] = useState<string | null>(null);
@@ -282,10 +422,101 @@ export default function LumaDashboard() {
   const [approvalFilter, setApprovalFilter] = useState<GuestStatus | "all">("pending_approval");
   const [registrationFilter, setRegistrationFilter] = useState<RegistrationFilter>("all");
   const [searchTerm, setSearchTerm] = useState("");
+  const [buildIdeaFilter, setBuildIdeaFilter] = useState("");
+  const [buildIdeaPresence, setBuildIdeaPresence] = useState<"all" | "filled" | "empty">("all");
+  const [draftFilter, setDraftFilter] = useState<DraftFilter>("all");
   const [includeSoloTeams, setIncludeSoloTeams] = useState(false);
+
+  const [showScrollTop, setShowScrollTop] = useState(false);
+
+  /* Hydrate filters from localStorage on mount */
+  useEffect(() => {
+    const saved = readFilters();
+    if (saved.activeTab) setActiveTab(saved.activeTab);
+    if (saved.approvalFilter) setApprovalFilter(saved.approvalFilter);
+    if (saved.registrationFilter) setRegistrationFilter(saved.registrationFilter);
+    if (saved.searchTerm) setSearchTerm(saved.searchTerm);
+    if (saved.buildIdeaFilter) setBuildIdeaFilter(saved.buildIdeaFilter);
+    if (saved.buildIdeaPresence) setBuildIdeaPresence(saved.buildIdeaPresence);
+    if (saved.draftFilter) setDraftFilter(saved.draftFilter);
+    if (saved.includeSoloTeams !== undefined) setIncludeSoloTeams(saved.includeSoloTeams);
+    if (saved.selectedEventApiId !== undefined) setSelectedEventApiId(saved.selectedEventApiId);
+    if (saved.showAllEvents !== undefined) setShowAllEvents(saved.showAllEvents);
+    setFiltersHydrated(true);
+  }, []);
+
+  /* Persist filters to localStorage on change */
+  useEffect(() => {
+    if (!filtersHydrated) return;
+    writeFilters({
+      activeTab,
+      approvalFilter,
+      registrationFilter,
+      searchTerm,
+      buildIdeaFilter,
+      buildIdeaPresence,
+      draftFilter,
+      includeSoloTeams,
+      selectedEventApiId,
+      showAllEvents,
+    });
+  }, [filtersHydrated, activeTab, approvalFilter, registrationFilter, searchTerm, buildIdeaFilter, buildIdeaPresence, draftFilter, includeSoloTeams, selectedEventApiId, showAllEvents]);
+
+  /* Scroll-to-top visibility */
+  useEffect(() => {
+    const onScroll = () => setShowScrollTop(window.scrollY > 400);
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
 
   const [selectedGuestApiId, setSelectedGuestApiId] = useState<string | null>(null);
   const [selectedTeamKey, setSelectedTeamKey] = useState<string | null>(null);
+  const [drawerExpanded, setDrawerExpanded] = useState(false);
+
+  const [panelWidth, setPanelWidth] = useState(DEFAULT_PANEL_WIDTH);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const isResizingRef = useRef(false);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(PANEL_WIDTH_KEY);
+    if (stored) {
+      const num = Number(stored);
+      if (Number.isFinite(num) && num >= MIN_PANEL_WIDTH) {
+        setPanelWidth(num);
+      }
+    }
+  }, []);
+
+  const onResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    isResizingRef.current = true;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    const onMouseMove = (ev: MouseEvent) => {
+      if (!isResizingRef.current || !gridRef.current) return;
+      const rect = gridRef.current.getBoundingClientRect();
+      const newWidth = rect.right - ev.clientX;
+      const maxWidth = rect.width * MAX_PANEL_RATIO;
+      const clamped = Math.max(MIN_PANEL_WIDTH, Math.min(newWidth, maxWidth));
+      setPanelWidth(clamped);
+    };
+
+    const onMouseUp = () => {
+      isResizingRef.current = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+      setPanelWidth((current) => {
+        localStorage.setItem(PANEL_WIDTH_KEY, String(Math.round(current)));
+        return current;
+      });
+    };
+
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+  }, []);
 
   const [confirmState, setConfirmState] = useState<ConfirmState>(null);
 
@@ -293,6 +524,75 @@ export default function LumaDashboard() {
   const [pendingTeamKey, setPendingTeamKey] = useState<string | null>(null);
 
   const [banner, setBanner] = useState<Banner | null>(null);
+
+  const [spotsRemaining, setSpotsRemaining] = useState<number | null>(null);
+  const [editingSpots, setEditingSpots] = useState(false);
+  const [spotsInput, setSpotsInput] = useState("");
+
+  const [visibleColumns, setVisibleColumns] = useState<PeopleColumn[]>(DEFAULT_VISIBLE);
+  const [columnMenu, setColumnMenu] = useState<{ x: number; y: number } | null>(null);
+
+  const [draftStatuses, setDraftStatuses] = useState<DraftStatusMap>(new Map());
+
+  useEffect(() => {
+    setVisibleColumns(readVisibleColumns());
+    setDraftStatuses(readDraftStatus());
+  }, []);
+
+  useEffect(() => {
+    setSpotsRemaining(readSpots());
+  }, []);
+
+  const setDraft = useCallback((guestApiId: string, status: DraftStatus) => {
+    setDraftStatuses((prev) => {
+      const next = new Map(prev);
+      if (next.get(guestApiId) === status) {
+        next.delete(guestApiId);
+      } else {
+        next.set(guestApiId, status);
+      }
+      writeDraftStatus(next);
+      return next;
+    });
+  }, []);
+
+  const toggleColumn = useCallback((col: PeopleColumn) => {
+    setVisibleColumns((prev) => {
+      const next = prev.includes(col) ? prev.filter((c) => c !== col) : [...prev, col];
+      writeVisibleColumns(next);
+      return next;
+    });
+  }, []);
+
+  const onHeaderContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    setColumnMenu({ x: e.clientX, y: e.clientY });
+  }, []);
+
+  useEffect(() => {
+    if (!columnMenu) return;
+    const close = () => setColumnMenu(null);
+    document.addEventListener("click", close);
+    document.addEventListener("contextmenu", close);
+    return () => {
+      document.removeEventListener("click", close);
+      document.removeEventListener("contextmenu", close);
+    };
+  }, [columnMenu]);
+
+  const colVisible = useCallback(
+    (col: PeopleColumn) => visibleColumns.includes(col),
+    [visibleColumns],
+  );
+
+  const decrementSpots = useCallback((count: number = 1) => {
+    setSpotsRemaining((current) => {
+      if (current === null) return null;
+      const next = Math.max(0, current - count);
+      writeSpots(next);
+      return next;
+    });
+  }, []);
 
   const visibleEvents = useMemo(() => {
     if (showAllEvents) {
@@ -312,19 +612,60 @@ export default function LumaDashboard() {
   }, [events, selectedEventApiId]);
 
   const filteredGuests = useMemo(() => {
+    const ideaQuery = buildIdeaFilter.trim().toLowerCase();
     return guests.filter((guest) => {
-      return (
-        matchesSearch(guest, searchTerm) &&
-        matchesRegistrationFilter(guest, registrationFilter)
-      );
+      if (!matchesSearch(guest, searchTerm)) return false;
+      if (!matchesRegistrationFilter(guest, registrationFilter)) return false;
+      if (buildIdeaPresence === "filled" && !guest.normalizedAnswers.buildIdea) return false;
+      if (buildIdeaPresence === "empty" && guest.normalizedAnswers.buildIdea) return false;
+      if (draftFilter !== "all") {
+        const status = draftStatuses.get(guest.apiId);
+        if (draftFilter === "accepted" && status !== "accepted") return false;
+        if (draftFilter === "rejected" && status !== "rejected") return false;
+        if (draftFilter === "undecided" && status !== undefined) return false;
+      }
+      if (ideaQuery) {
+        const idea = (guest.normalizedAnswers.buildIdea ?? "").toLowerCase();
+        if (!idea.includes(ideaQuery)) return false;
+      }
+      return true;
     });
-  }, [guests, registrationFilter, searchTerm]);
+  }, [buildIdeaFilter, buildIdeaPresence, draftFilter, draftStatuses, guests, registrationFilter, searchTerm]);
 
   const teams = useMemo(() => {
     return buildTeamAggregates(filteredGuests, {
       includeSolo: includeSoloTeams,
     });
   }, [filteredGuests, includeSoloTeams]);
+
+  const exportCsv = useCallback(() => {
+    if (activeTab === "teams") {
+      const headers = ["Team", "Members", "Pending", "Approved", "Declined"];
+      const rows = teams.map((team) => [
+        team.displayName,
+        String(team.members.length),
+        String(team.counts.pending_approval),
+        String(team.counts.approved),
+        String(team.counts.declined),
+      ]);
+      downloadCsv("teams-export.csv", headers, rows);
+    } else {
+      const headers: string[] = ["Name", "Email"];
+      if (visibleColumns.includes("team")) headers.push("Team");
+      if (visibleColumns.includes("status")) headers.push("Status");
+      if (visibleColumns.includes("buildIdea")) headers.push("Build Idea");
+
+      const exportable = filteredGuests.filter((guest) => draftStatuses.get(guest.apiId) !== "rejected");
+      const rows = exportable.map((guest) => {
+        const row: string[] = [guest.name, guest.email];
+        if (visibleColumns.includes("team")) row.push(guest.teamNameRaw || "Solo");
+        if (visibleColumns.includes("status")) row.push(guest.approvalStatus);
+        if (visibleColumns.includes("buildIdea")) row.push(guest.normalizedAnswers.buildIdea ?? "");
+        return row;
+      });
+      downloadCsv("people-export.csv", headers, rows);
+    }
+  }, [activeTab, draftStatuses, filteredGuests, teams, visibleColumns]);
 
   const selectedGuest = useMemo(() => {
     if (!selectedGuestApiId) {
@@ -435,6 +776,7 @@ export default function LumaDashboard() {
 
     setSelectedGuestApiId(null);
     setSelectedTeamKey(null);
+    setDrawerExpanded(false);
     void loadGuests("load");
   }, [loadGuests, selectedEvent]);
 
@@ -517,12 +859,15 @@ export default function LumaDashboard() {
         return;
       }
 
+      if (guest.approvalStatus !== "approved") {
+        decrementSpots(1);
+      }
       setBanner({
         kind: "success",
         message: `Approved ${guest.name}.`,
       });
     },
-    [updateGuestStatus],
+    [decrementSpots, updateGuestStatus],
   );
 
   const onGuestDecline = useCallback((guest: GuestReviewRecord) => {
@@ -585,6 +930,12 @@ export default function LumaDashboard() {
             !result.ok,
         );
 
+        const successCount = candidates.length - failures.length;
+
+        if (status === "approved" && successCount > 0) {
+          decrementSpots(successCount);
+        }
+
         if (!failures.length) {
           setBanner({
             kind: "success",
@@ -595,13 +946,13 @@ export default function LumaDashboard() {
 
         setBanner({
           kind: "error",
-          message: `Updated ${candidates.length - failures.length}/${candidates.length} attendees in ${team.displayName}. ${failures.length} failed. First error: ${failures[0].message}`,
+          message: `Updated ${successCount}/${candidates.length} attendees in ${team.displayName}. ${failures.length} failed. First error: ${failures[0].message}`,
         });
       } finally {
         setPendingTeamKey(null);
       }
     },
-    [loadGuests, updateGuestStatus],
+    [decrementSpots, loadGuests, updateGuestStatus],
   );
 
   const onConfirmAction = useCallback(async () => {
@@ -625,6 +976,9 @@ export default function LumaDashboard() {
       const result = await updateGuestStatus(guest, status, shouldRefund, true);
 
       if (result.ok) {
+        if (status === "approved" && guest.approvalStatus !== "approved") {
+          decrementSpots(1);
+        }
         setBanner({
           kind: "success",
           message: `${status === "approved" ? "Approved" : "Declined"} ${guest.name}.`,
@@ -640,7 +994,7 @@ export default function LumaDashboard() {
     const { team, status, shouldRefund } = confirmState;
     await executeTeamUpdate(team, status, shouldRefund);
     setConfirmState(null);
-  }, [confirmState, executeTeamUpdate, updateGuestStatus]);
+  }, [confirmState, decrementSpots, executeTeamUpdate, updateGuestStatus]);
 
   const onRetryGuests = useCallback(() => {
     void loadGuests("load");
@@ -659,13 +1013,26 @@ export default function LumaDashboard() {
   const drawerOpen = Boolean(selectedGuest || selectedTeam);
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen overflow-x-clip">
       {/* Top accent line */}
       <div className="h-px bg-gradient-to-r from-transparent via-[var(--accent-light)] to-transparent opacity-50" />
 
-      <div className="mx-auto grid w-full max-w-[1520px] lg:grid-cols-[1fr_380px]">
+      <div
+        ref={gridRef}
+        className={cn(
+          "mx-auto grid w-full grid-cols-1",
+          !drawerExpanded && "lg:[grid-template-columns:minmax(0,1fr)_1px_var(--panel-width)]",
+          drawerExpanded && "max-w-[960px]",
+        )}
+        style={drawerExpanded ? undefined : ({ "--panel-width": `${Math.round(panelWidth)}px` } as React.CSSProperties)}
+      >
         {/* ── Main content ── */}
-        <main className="space-y-5 border-r border-[var(--border-subtle)] px-6 pt-7 pb-10">
+        <main
+          className={cn(
+            "min-w-0 space-y-5 overflow-hidden px-6 pt-7 pb-10",
+            drawerExpanded && "hidden",
+          )}
+        >
           {/* Header */}
           <header className="space-y-5">
             <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
@@ -692,10 +1059,20 @@ export default function LumaDashboard() {
                 </button>
                 <button
                   type="button"
+                  className="rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)]/30 hover:text-[var(--text)]"
+                  onClick={exportCsv}
+                >
+                  Export CSV
+                </button>
+                <button
+                  type="button"
                   className="rounded-lg bg-[var(--accent)] px-3.5 py-2 text-xs font-medium text-white transition-colors hover:bg-[var(--accent-light)]"
                   onClick={() => {
                     setBanner(null);
                     setSearchTerm("");
+                    setBuildIdeaFilter("");
+                    setBuildIdeaPresence("all");
+                    setDraftFilter("all");
                     setRegistrationFilter("all");
                     setApprovalFilter("pending_approval");
                   }}
@@ -705,8 +1082,8 @@ export default function LumaDashboard() {
               </div>
             </div>
 
-            {/* Filters */}
-            <div className="grid gap-3 lg:grid-cols-[minmax(260px,1fr)_minmax(200px,1fr)_minmax(170px,1fr)_minmax(170px,1fr)]">
+            {/* Filters — row 1: dropdowns */}
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[minmax(220px,1.4fr)_minmax(130px,1fr)_minmax(130px,1fr)_minmax(130px,1fr)]">
               <label className="space-y-1.5">
                 <span className="text-[11px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
                   Event
@@ -765,14 +1142,62 @@ export default function LumaDashboard() {
 
               <label className="space-y-1.5">
                 <span className="text-[11px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
+                  Draft
+                </span>
+                <select
+                  className={selectClass}
+                  value={draftFilter}
+                  onChange={(event) =>
+                    setDraftFilter(event.target.value as DraftFilter)
+                  }
+                >
+                  <option value="all">All</option>
+                  <option value="accepted">Draft Accepted</option>
+                  <option value="rejected">Draft Rejected</option>
+                  <option value="undecided">Undecided</option>
+                </select>
+              </label>
+            </div>
+
+            {/* Filters — row 2: text inputs */}
+            <div className="grid gap-3 sm:grid-cols-[1fr_1fr_minmax(120px,0.6fr)]">
+              <label className="space-y-1.5">
+                <span className="text-[11px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
                   Search
                 </span>
                 <input
                   className={inputClass}
-                  placeholder="Name, email, idea\u2026"
+                  placeholder="Name, email\u2026"
                   value={searchTerm}
                   onChange={(event) => setSearchTerm(event.target.value)}
                 />
+              </label>
+
+              <label className="space-y-1.5">
+                <span className="text-[11px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
+                  Build Idea
+                </span>
+                <input
+                  className={inputClass}
+                  placeholder="Filter by build idea\u2026"
+                  value={buildIdeaFilter}
+                  onChange={(event) => setBuildIdeaFilter(event.target.value)}
+                />
+              </label>
+
+              <label className="space-y-1.5">
+                <span className="text-[11px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
+                  Has Idea
+                </span>
+                <select
+                  className={selectClass}
+                  value={buildIdeaPresence}
+                  onChange={(event) => setBuildIdeaPresence(event.target.value as "all" | "filled" | "empty")}
+                >
+                  <option value="all">All</option>
+                  <option value="filled">Has idea</option>
+                  <option value="empty">No idea</option>
+                </select>
               </label>
             </div>
 
@@ -818,6 +1243,111 @@ export default function LumaDashboard() {
           {/* Banner */}
           {banner ? <BannerNotice banner={banner} /> : null}
 
+          {/* Approval budget */}
+          <div
+            className={cn(
+              "flex items-center justify-between rounded-lg border px-4 py-3",
+              spotsRemaining === null
+                ? "border-dashed border-[var(--border)]"
+                : spotsRemaining > 0
+                  ? "border-[var(--accent)]/20 bg-[var(--accent-glow)]"
+                  : "border-red-500/20 bg-red-500/[0.06]",
+            )}
+          >
+            {editingSpots ? (
+              <form
+                className="flex w-full items-center gap-3"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const num = Number(spotsInput);
+                  if (Number.isFinite(num) && num >= 0) {
+                    setSpotsRemaining(Math.round(num));
+                    writeSpots(Math.round(num));
+                  }
+                  setEditingSpots(false);
+                }}
+              >
+                <input
+                  autoFocus
+                  type="number"
+                  min="0"
+                  className="w-24 rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-1.5 text-sm tabular-nums text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                  value={spotsInput}
+                  onChange={(e) => setSpotsInput(e.target.value)}
+                />
+                <button
+                  type="submit"
+                  className="rounded-md bg-[var(--accent)] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[var(--accent-light)]"
+                >
+                  Save
+                </button>
+                <button
+                  type="button"
+                  className="text-xs text-[var(--text-muted)] transition-colors hover:text-[var(--text)]"
+                  onClick={() => setEditingSpots(false)}
+                >
+                  Cancel
+                </button>
+              </form>
+            ) : spotsRemaining === null ? (
+              <div className="flex w-full items-center justify-between">
+                <span className="text-sm text-[var(--text-muted)]">
+                  No approval capacity set
+                </span>
+                <button
+                  type="button"
+                  className="rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)]/30 hover:text-[var(--text)]"
+                  onClick={() => {
+                    setSpotsInput("");
+                    setEditingSpots(true);
+                  }}
+                >
+                  Set capacity
+                </button>
+              </div>
+            ) : (
+              <div className="flex w-full items-center justify-between">
+                <div className="flex items-baseline gap-2.5">
+                  <span
+                    className={cn(
+                      "font-display text-2xl font-bold tabular-nums",
+                      spotsRemaining > 0
+                        ? "text-[var(--accent-light)]"
+                        : "text-red-400",
+                    )}
+                  >
+                    {spotsRemaining}
+                  </span>
+                  <span className="text-sm text-[var(--text-secondary)]">
+                    {spotsRemaining === 1 ? "spot remaining" : "spots remaining"}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="rounded-md border border-[var(--border)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)]/30 hover:text-[var(--text)]"
+                    onClick={() => {
+                      setSpotsInput(String(spotsRemaining));
+                      setEditingSpots(true);
+                    }}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    className="text-xs text-[var(--text-muted)] transition-colors hover:text-red-400"
+                    onClick={() => {
+                      setSpotsRemaining(null);
+                      writeSpots(null);
+                    }}
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* Metrics */}
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <InlineMetric label="Pending" value={metrics.pending} />
@@ -831,7 +1361,17 @@ export default function LumaDashboard() {
           {guestsError ? <ErrorPanel error={guestsError} onRetry={onRetryGuests} /> : null}
 
           {/* ── Data table section ── */}
-          <section className="overflow-hidden rounded-xl border border-[var(--border)]">
+          <section className="relative overflow-hidden rounded-xl border border-[var(--border)]">
+            {/* Progress bar — visible during any loading */}
+            {(eventsLoading || guestsLoading || guestsRefreshing) ? (
+              <div className="absolute inset-x-0 top-0 z-10 h-0.5 overflow-hidden bg-[var(--accent)]/10">
+                <div
+                  className="h-full w-1/4 rounded-full bg-[var(--accent)]"
+                  style={{ animation: "progress-slide 1.4s ease-in-out infinite" }}
+                />
+              </div>
+            ) : null}
+
             {/* Tab bar */}
             <div className="flex items-center justify-between border-b border-[var(--border)] bg-[var(--bg-raised)] px-1">
               <div className="flex">
@@ -867,14 +1407,29 @@ export default function LumaDashboard() {
                 </button>
               </div>
 
-              {guestsLoading ? (
+              {(eventsLoading || guestsLoading) ? (
                 <span className="pr-3 text-xs text-[var(--text-muted)]">Loading\u2026</span>
+              ) : guestsRefreshing ? (
+                <span className="pr-3 text-xs text-[var(--text-muted)]">Refreshing\u2026</span>
               ) : null}
             </div>
 
-            {/* Teams table */}
-            {activeTab === "teams" ? (
-              <div className="overflow-x-auto">
+            {/* Loading state — replaces table body during full loads */}
+            {eventsLoading || guestsLoading ? (
+              <div className="flex flex-col items-center justify-center py-20">
+                <div className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--border)] border-t-[var(--accent)]" />
+                <p className="mt-3 text-sm text-[var(--text-muted)]">
+                  {eventsLoading ? "Loading events\u2026" : "Loading guests\u2026"}
+                </p>
+              </div>
+            ) : activeTab === "teams" ? (
+              /* Teams table */
+              <div
+                className={cn(
+                  "overflow-x-auto transition-opacity duration-200",
+                  guestsRefreshing && "pointer-events-none opacity-40",
+                )}
+              >
                 <table className="min-w-full text-left text-sm">
                   <thead>
                     <tr className="border-b border-[var(--border)] text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
@@ -957,14 +1512,55 @@ export default function LumaDashboard() {
               </div>
             ) : (
               /* People table */
-              <div className="overflow-x-auto">
+              <div
+                className={cn(
+                  "relative overflow-x-auto transition-opacity duration-200",
+                  guestsRefreshing && "pointer-events-none opacity-40",
+                )}
+              >
+                {/* Column visibility context menu */}
+                {columnMenu ? (
+                  <div
+                    className="fixed z-50 min-w-[180px] rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] py-1.5 shadow-xl shadow-black/40"
+                    style={{ left: columnMenu.x, top: columnMenu.y }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <p className="px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
+                      Toggle columns
+                    </p>
+                    {ALL_PEOPLE_COLUMNS.map((col) => (
+                      <button
+                        key={col.key}
+                        type="button"
+                        className="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-sm text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text)]"
+                        onClick={() => toggleColumn(col.key)}
+                      >
+                        <span
+                          className={cn(
+                            "flex h-4 w-4 shrink-0 items-center justify-center rounded border text-[10px]",
+                            colVisible(col.key)
+                              ? "border-[var(--accent)] bg-[var(--accent)] text-white"
+                              : "border-[var(--border)] bg-transparent text-transparent",
+                          )}
+                        >
+                          {"\u2713"}
+                        </span>
+                        {col.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+
                 <table className="min-w-full text-left text-sm">
                   <thead>
-                    <tr className="border-b border-[var(--border)] text-[11px] uppercase tracking-wider text-[var(--text-muted)]">
+                    <tr
+                      className="border-b border-[var(--border)] text-[11px] uppercase tracking-wider text-[var(--text-muted)]"
+                      onContextMenu={onHeaderContextMenu}
+                    >
                       <th className="px-4 py-3 font-medium">Name</th>
-                      <th className="px-4 py-3 font-medium">Team</th>
-                      <th className="px-4 py-3 font-medium">Status</th>
-                      <th className="px-4 py-3 font-medium">Build Idea</th>
+                      {colVisible("team") ? <th className="px-4 py-3 font-medium">Team</th> : null}
+                      {colVisible("status") ? <th className="px-4 py-3 font-medium">Status</th> : null}
+                      {colVisible("buildIdea") ? <th className="min-w-[280px] px-4 py-3 font-medium">Build Idea</th> : null}
                       <th className="px-4 py-3 text-right font-medium">Actions</th>
                     </tr>
                   </thead>
@@ -973,67 +1569,111 @@ export default function LumaDashboard() {
                       <tr>
                         <td
                           className="px-4 py-8 text-center text-sm text-[var(--text-muted)]"
-                          colSpan={5}
+                          colSpan={2 + visibleColumns.length}
                         >
                           No guests match this filter.
                         </td>
                       </tr>
                     ) : null}
 
-                    {filteredGuests.map((guest) => (
-                      <tr
-                        key={guest.apiId}
-                        className="cursor-pointer border-t border-[var(--border-subtle)] transition-colors hover:bg-[var(--bg-hover)]"
-                        onClick={() => {
-                          setSelectedGuestApiId(guest.apiId);
-                          setSelectedTeamKey(null);
-                        }}
-                      >
-                        <td className="px-4 py-3 align-top">
-                          <div className="font-medium">{guest.name}</div>
-                          <div className="text-xs text-[var(--text-muted)]">{guest.email}</div>
-                        </td>
-                        <td className="px-4 py-3 align-top text-[var(--text-secondary)]">
-                          {guest.teamNameRaw || "Solo"}
-                        </td>
-                        <td className="px-4 py-3 align-top">
-                          <span
-                            className={cn(
-                              "inline-flex rounded-full border px-2 py-0.5 text-xs font-medium",
-                              statusBadge(guest.approvalStatus),
-                            )}
-                          >
-                            {guest.approvalStatus}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3 align-top text-xs text-[var(--text-muted)]">
-                          {shortText(guest.normalizedAnswers.buildIdea, 110)}
-                        </td>
-                        <td className="px-4 py-3 align-top text-right">
-                          <div
-                            className="inline-flex gap-2"
-                            onClick={(event) => event.stopPropagation()}
-                          >
-                            <button
-                              type="button"
-                              className="rounded-md bg-[var(--accent)] px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-[var(--accent-light)] disabled:opacity-40"
-                              onClick={() => void onGuestApprove(guest)}
-                              disabled={Boolean(pendingGuestIds[guest.apiId])}
+                    {filteredGuests.map((guest) => {
+                      const guestDraft = draftStatuses.get(guest.apiId);
+                      const isDraftRejected = guestDraft === "rejected";
+                      const isDraftAccepted = guestDraft === "accepted";
+                      return (
+                        <tr
+                          key={guest.apiId}
+                          className={cn(
+                            "cursor-pointer border-t border-[var(--border-subtle)] transition-colors hover:bg-[var(--bg-hover)]",
+                            isDraftRejected && "opacity-45",
+                            isDraftAccepted && "border-l-2 border-l-[var(--accent)]",
+                          )}
+                          onClick={() => {
+                            setSelectedGuestApiId(guest.apiId);
+                            setSelectedTeamKey(null);
+                            setDrawerExpanded(false);
+                          }}
+                        >
+                          <td className="px-4 py-3 align-top">
+                            <div className={cn("font-medium", isDraftRejected && "line-through decoration-red-500/60", isDraftAccepted && "text-[var(--accent-light)]")}>
+                              {guest.name}
+                            </div>
+                            <div className="text-xs text-[var(--text-muted)]">{guest.email}</div>
+                          </td>
+                          {colVisible("team") ? (
+                            <td className={cn("px-4 py-3 align-top text-[var(--text-secondary)]", isDraftRejected && "line-through decoration-red-500/60")}>
+                              {guest.teamNameRaw || "Solo"}
+                            </td>
+                          ) : null}
+                          {colVisible("status") ? (
+                            <td className="px-4 py-3 align-top">
+                              <span
+                                className={cn(
+                                  "inline-flex rounded-full border px-2 py-0.5 text-xs font-medium",
+                                  statusBadge(guest.approvalStatus),
+                                )}
+                              >
+                                {guest.approvalStatus}
+                              </span>
+                            </td>
+                          ) : null}
+                          {colVisible("buildIdea") ? (
+                            <td className={cn("min-w-[280px] max-w-[420px] px-4 py-3 align-top text-sm leading-relaxed text-[var(--text-secondary)]", isDraftRejected && "line-through decoration-red-500/60")}>
+                              {guest.normalizedAnswers.buildIdea || <span className="text-[var(--text-muted)]">{"\u2014"}</span>}
+                            </td>
+                          ) : null}
+                          <td className="px-4 py-3 align-top text-right">
+                            <div
+                              className="inline-flex gap-2"
+                              onClick={(event) => event.stopPropagation()}
                             >
-                              {pendingGuestIds[guest.apiId] ? "Working\u2026" : "Approve"}
-                            </button>
-                            <button
-                              type="button"
-                              className="rounded-md border border-[var(--border)] px-3 py-1 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-red-500/40 hover:text-red-400 disabled:opacity-40"
-                              onClick={() => onGuestDecline(guest)}
-                              disabled={Boolean(pendingGuestIds[guest.apiId])}
-                            >
-                              Decline
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
+                              <button
+                                type="button"
+                                className={cn(
+                                  "rounded-md px-3 py-1 text-xs font-medium transition-colors",
+                                  isDraftAccepted
+                                    ? "border border-[var(--accent)] bg-[var(--accent-glow)] text-[var(--accent-light)] hover:bg-[var(--accent)]/20"
+                                    : "border border-emerald-500/30 text-emerald-400/70 hover:border-emerald-500/50 hover:text-emerald-400",
+                                )}
+                                onClick={() => setDraft(guest.apiId, "accepted")}
+                                title={isDraftAccepted ? "Undo draft accept" : "Draft accept (local only)"}
+                              >
+                                {isDraftAccepted ? "Undo \u2713" : "Draft \u2713"}
+                              </button>
+                              <button
+                                type="button"
+                                className={cn(
+                                  "rounded-md px-3 py-1 text-xs font-medium transition-colors",
+                                  isDraftRejected
+                                    ? "border border-red-500/40 bg-red-500/10 text-red-400 hover:bg-red-500/20"
+                                    : "border border-red-500/30 text-red-400/70 hover:border-red-500/50 hover:text-red-400",
+                                )}
+                                onClick={() => setDraft(guest.apiId, "rejected")}
+                                title={isDraftRejected ? "Undo draft rejection" : "Draft reject (local only)"}
+                              >
+                                {isDraftRejected ? "Undo \u2715" : "Draft \u2715"}
+                              </button>
+                              <button
+                                type="button"
+                                className="rounded-md bg-[var(--accent)] px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-[var(--accent-light)] disabled:opacity-40"
+                                onClick={() => void onGuestApprove(guest)}
+                                disabled={Boolean(pendingGuestIds[guest.apiId])}
+                              >
+                                {pendingGuestIds[guest.apiId] ? "Working\u2026" : "Approve"}
+                              </button>
+                              <button
+                                type="button"
+                                className="rounded-md border border-[var(--border)] px-3 py-1 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-red-500/40 hover:text-red-400 disabled:opacity-40"
+                                onClick={() => onGuestDecline(guest)}
+                                disabled={Boolean(pendingGuestIds[guest.apiId])}
+                              >
+                                Decline
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1041,9 +1681,32 @@ export default function LumaDashboard() {
           </section>
         </main>
 
+        {/* ── Resize handle ── */}
+        {!drawerExpanded ? (
+          <div
+            className="group relative hidden cursor-col-resize bg-[var(--border-subtle)] lg:block"
+            onMouseDown={onResizeStart}
+          >
+            {/* Wider invisible hit area */}
+            <div className="absolute inset-y-0 -left-[5px] -right-[5px] z-20" />
+            {/* Visual grip indicator */}
+            <div className="pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col gap-[3px] opacity-0 transition-opacity group-hover:opacity-100">
+              <span className="block h-[3px] w-[3px] rounded-full bg-[var(--text-muted)]" />
+              <span className="block h-[3px] w-[3px] rounded-full bg-[var(--text-muted)]" />
+              <span className="block h-[3px] w-[3px] rounded-full bg-[var(--text-muted)]" />
+            </div>
+          </div>
+        ) : null}
+
         {/* ── Detail drawer ── */}
-        <aside className="lg:sticky lg:top-0 lg:h-screen lg:overflow-y-auto">
-          <div className="p-5">
+        <aside
+          className={cn(
+            drawerExpanded
+              ? "px-6 pt-7 pb-10"
+              : "lg:sticky lg:top-0 lg:h-screen lg:overflow-y-auto",
+          )}
+        >
+          <div className={drawerExpanded ? "" : "p-5"}>
             {/* Empty state */}
             {!drawerOpen ? (
               <div className="flex h-[calc(100vh-80px)] flex-col items-center justify-center text-center">
@@ -1181,6 +1844,29 @@ export default function LumaDashboard() {
             {/* Team detail */}
             {selectedTeam ? (
               <div className="space-y-5">
+                {/* Back to table bar (expanded mode) */}
+                {drawerExpanded ? (
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-2 text-sm text-[var(--text-muted)] transition-colors hover:text-[var(--text)]"
+                    onClick={() => setDrawerExpanded(false)}
+                  >
+                    <svg
+                      width="16"
+                      height="16"
+                      viewBox="0 0 16 16"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M10 3L5 8l5 5" />
+                    </svg>
+                    Back to table
+                  </button>
+                ) : null}
+
                 <div className="flex items-start justify-between gap-3 border-b border-[var(--border)] pb-4">
                   <div>
                     <p className="text-[11px] font-medium uppercase tracking-wider text-[var(--accent-light)]">
@@ -1195,24 +1881,65 @@ export default function LumaDashboard() {
                       </p>
                     ) : null}
                   </div>
-                  <button
-                    type="button"
-                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[var(--border)] text-[var(--text-muted)] transition-colors hover:border-[var(--text-muted)] hover:text-[var(--text)]"
-                    onClick={() => setSelectedTeamKey(null)}
-                    aria-label="Close"
-                  >
-                    <svg
-                      width="14"
-                      height="14"
-                      viewBox="0 0 14 14"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.5"
-                      strokeLinecap="round"
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    {/* Expand / collapse toggle */}
+                    <button
+                      type="button"
+                      className="flex h-7 w-7 items-center justify-center rounded-md border border-[var(--border)] text-[var(--text-muted)] transition-colors hover:border-[var(--accent)]/30 hover:text-[var(--accent-light)]"
+                      onClick={() => setDrawerExpanded((v) => !v)}
+                      aria-label={drawerExpanded ? "Collapse panel" : "Expand panel"}
                     >
-                      <path d="M3 3l8 8M11 3l-8 8" />
-                    </svg>
-                  </button>
+                      {drawerExpanded ? (
+                        <svg
+                          width="14"
+                          height="14"
+                          viewBox="0 0 14 14"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.5"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <path d="M9 1v4h4M5 13V9H1M9 5L13 1M5 9l-4 4" />
+                        </svg>
+                      ) : (
+                        <svg
+                          width="14"
+                          height="14"
+                          viewBox="0 0 14 14"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.5"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <path d="M13 5V1h-4M1 9v4h4M13 1L9 5M1 13l4-4" />
+                        </svg>
+                      )}
+                    </button>
+                    {/* Close */}
+                    <button
+                      type="button"
+                      className="flex h-7 w-7 items-center justify-center rounded-md border border-[var(--border)] text-[var(--text-muted)] transition-colors hover:border-[var(--text-muted)] hover:text-[var(--text)]"
+                      onClick={() => {
+                        setSelectedTeamKey(null);
+                        setDrawerExpanded(false);
+                      }}
+                      aria-label="Close"
+                    >
+                      <svg
+                        width="14"
+                        height="14"
+                        viewBox="0 0 14 14"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.5"
+                        strokeLinecap="round"
+                      >
+                        <path d="M3 3l8 8M11 3l-8 8" />
+                      </svg>
+                    </button>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-2">
@@ -1222,36 +1949,147 @@ export default function LumaDashboard() {
                   <InlineMetric label="Declined" value={selectedTeam.counts.declined} />
                 </div>
 
-                <div className="space-y-2">
+                <div className="space-y-3">
                   <p className="text-[11px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
                     Members
                   </p>
-                  {selectedTeam.members.map((member) => (
-                    <button
+                  {selectedTeam.members.map((member) => {
+                    const memberDraft = draftStatuses.get(member.apiId);
+                    const memberDraftRejected = memberDraft === "rejected";
+                    const memberDraftAccepted = memberDraft === "accepted";
+                    return (
+                    <div
                       key={member.apiId}
-                      type="button"
-                      className="flex w-full items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-2.5 text-left text-sm transition-colors hover:border-[var(--accent)]/25 hover:bg-[var(--bg-hover)]"
-                      onClick={() => {
-                        setSelectedTeamKey(null);
-                        setSelectedGuestApiId(member.apiId);
-                      }}
+                      className={cn(
+                        "rounded-lg border bg-[var(--bg-elevated)]",
+                        memberDraftRejected && "border-[var(--border)] opacity-45",
+                        memberDraftAccepted && "border-[var(--accent)]/40",
+                        !memberDraft && "border-[var(--border)]",
+                      )}
                     >
-                      <span>
-                        <span className="font-medium">{member.name}</span>
-                        <span className="block text-xs text-[var(--text-muted)]">
-                          {member.email}
-                        </span>
-                      </span>
-                      <span
-                        className={cn(
-                          "rounded-full border px-2 py-0.5 text-xs font-medium",
-                          statusBadge(member.approvalStatus),
-                        )}
-                      >
-                        {member.approvalStatus}
-                      </span>
-                    </button>
-                  ))}
+                      {/* Member header */}
+                      <div className="flex items-center justify-between border-b border-[var(--border-subtle)] px-3 py-2.5">
+                        <div>
+                          <p className={cn("text-sm font-medium", memberDraftRejected && "line-through decoration-red-500/60", memberDraftAccepted && "text-[var(--accent-light)]")}>
+                            {member.name}
+                          </p>
+                          <p className="text-xs text-[var(--text-muted)]">{member.email}</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            className={cn(
+                              "rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors",
+                              memberDraftAccepted
+                                ? "border border-[var(--accent)] bg-[var(--accent-glow)] text-[var(--accent-light)]"
+                                : "border border-emerald-500/30 text-emerald-400/70 hover:text-emerald-400",
+                            )}
+                            onClick={() => setDraft(member.apiId, "accepted")}
+                            title={memberDraftAccepted ? "Undo draft accept" : "Draft accept (local only)"}
+                          >
+                            {memberDraftAccepted ? "Undo \u2713" : "Draft \u2713"}
+                          </button>
+                          <button
+                            type="button"
+                            className={cn(
+                              "rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors",
+                              memberDraftRejected
+                                ? "border border-red-500/40 bg-red-500/10 text-red-400"
+                                : "border border-red-500/30 text-red-400/70 hover:text-red-400",
+                            )}
+                            onClick={() => setDraft(member.apiId, "rejected")}
+                            title={memberDraftRejected ? "Undo draft rejection" : "Draft reject (local only)"}
+                          >
+                            {memberDraftRejected ? "Undo \u2715" : "Draft \u2715"}
+                          </button>
+                          <span
+                            className={cn(
+                              "rounded-full border px-2 py-0.5 text-xs font-medium",
+                              statusBadge(member.approvalStatus),
+                            )}
+                          >
+                            {member.approvalStatus}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Member details */}
+                      <div className="grid gap-3 px-3 py-3">
+                        <DetailItem
+                          label="Affiliation"
+                          value={member.normalizedAnswers.affiliation}
+                        />
+                        <DetailItem
+                          label="Registering as"
+                          value={member.normalizedAnswers.registrationAs}
+                        />
+                        <DetailItem
+                          label="Codex usage"
+                          value={member.normalizedAnswers.codexUsage}
+                        />
+                        <DetailItem
+                          label="In-person"
+                          value={
+                            member.normalizedAnswers.inPersonConfirmed === null
+                              ? null
+                              : member.normalizedAnswers.inPersonConfirmed
+                                ? "Yes"
+                                : "No"
+                          }
+                        />
+                        <DetailItem
+                          label="Build idea"
+                          value={member.normalizedAnswers.buildIdea}
+                        />
+                        <DetailItem
+                          label="Additional notes"
+                          value={member.normalizedAnswers.additionalNotes}
+                        />
+
+                        {/* Profile links */}
+                        {(member.normalizedAnswers.linkedin ||
+                          member.normalizedAnswers.github ||
+                          member.normalizedAnswers.twitterX) ? (
+                          <div className="space-y-2 rounded-md border border-[var(--border-subtle)] bg-[var(--bg-raised)] p-2.5">
+                            <p className="text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
+                              Links
+                            </p>
+                            {member.normalizedAnswers.linkedin ? (
+                              <DetailItem label="LinkedIn" value={member.normalizedAnswers.linkedin} />
+                            ) : null}
+                            {member.normalizedAnswers.github ? (
+                              <DetailItem label="GitHub" value={member.normalizedAnswers.github} />
+                            ) : null}
+                            {member.normalizedAnswers.twitterX ? (
+                              <DetailItem label="X" value={member.normalizedAnswers.twitterX} />
+                            ) : null}
+                          </div>
+                        ) : null}
+
+                        {/* Raw answers */}
+                        {Object.entries(member.normalizedAnswers.rawAnswerMap).length ? (
+                          <div className="space-y-2 rounded-md border border-[var(--border-subtle)] bg-[var(--bg-raised)] p-2.5">
+                            <p className="text-[10px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
+                              Raw Answers
+                            </p>
+                            {Object.entries(member.normalizedAnswers.rawAnswerMap).map(
+                              ([label, value]) => (
+                                <div key={label}>
+                                  <p className="text-xs font-medium text-[var(--text-secondary)]">
+                                    {label}
+                                  </p>
+                                  <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+                                    {value}
+                                  </p>
+                                </div>
+                              ),
+                            )}
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                    );
+                  })}
                 </div>
               </div>
             ) : null}
@@ -1325,6 +2163,29 @@ export default function LumaDashboard() {
             </div>
           </div>
         </div>
+      ) : null}
+
+      {/* Scroll to top */}
+      {showScrollTop ? (
+        <button
+          type="button"
+          className="fixed right-6 bottom-6 z-40 flex h-10 w-10 items-center justify-center rounded-full border border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--text-muted)] shadow-lg shadow-black/30 transition-all hover:border-[var(--accent)]/40 hover:text-[var(--accent-light)]"
+          onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+          aria-label="Scroll to top"
+        >
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M8 13V3M3 7l5-5 5 5" />
+          </svg>
+        </button>
       ) : null}
     </div>
   );

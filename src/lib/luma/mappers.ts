@@ -158,7 +158,8 @@ export function normalizeLinkedIn(value: string | null): string | null {
     return normalizeUrl(cleaned, "https://");
   }
 
-  return `https://www.linkedin.com/in/${cleaned.replace(/^in\//i, "")}`;
+  const slug = cleaned.replace(/^\/+/, "").replace(/^in\//i, "");
+  return `https://www.linkedin.com/in/${slug}`;
 }
 
 export function normalizeGitHub(value: string | null): string | null {
@@ -171,7 +172,8 @@ export function normalizeGitHub(value: string | null): string | null {
     return normalizeUrl(cleaned, "https://");
   }
 
-  return `https://github.com/${cleaned}`;
+  const slug = cleaned.replace(/^\/+/, "");
+  return `https://github.com/${slug}`;
 }
 
 export function normalizeTwitterX(value: string | null): string | null {
@@ -185,7 +187,8 @@ export function normalizeTwitterX(value: string | null): string | null {
     return normalizeUrl(converted, "https://");
   }
 
-  return `https://x.com/${cleaned}`;
+  const slug = cleaned.replace(/^\/+/, "");
+  return `https://x.com/${slug}`;
 }
 
 function parseBooleanish(value: string | null): boolean | null {
